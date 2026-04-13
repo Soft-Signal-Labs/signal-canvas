@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hand Panel</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: monospace; }
+  #container { position: relative; width: 100vw; height: 100vh; }
+  video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+  #panelCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  #status { position: absolute; top: 16px; left: 16px; color: #0f0; font-size: 14px; z-index: 10; background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="container">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="overlay"></canvas>
+  <canvas id="panelCanvas"></canvas>
+  <div id="status">Loading MediaPipe...</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.min.js"></script>
+
+<script>
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const panelCanvas = document.getElementById('panelCanvas');
+const status = document.getElementById('status');
+const octx = overlay.getContext('2d');
+const pctx = panelCanvas.getContext('2d');
+
+let vw, vh;
+function resize() {
+  vw = window.innerWidth; vh = window.innerHeight;
+  overlay.width = vw; overlay.height = vh;
+  panelCanvas.width = vw; panelCanvas.height = vh;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Particle system for the panel interior
+const particles = [];
+for (let i = 0; i < 120; i++) {
+  particles.push({
+    x: Math.random(), y: Math.random(),
+    vx: (Math.random() - 0.5) * 0.002,
+    vy: (Math.random() - 0.5) * 0.002,
+    size: Math.random() * 2.5 + 0.5,
+    brightness: Math.random()
+  });
+}
+
+function updateParticles() {
+  for (const p of particles) {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.brightness += (Math.random() - 0.5) * 0.04;
+    p.brightness = Math.max(0.15, Math.min(1, p.brightness));
+    if (p.x < 0 || p.x > 1) p.vx *= -1;
+    if (p.y < 0 || p.y > 1) p.vy *= -1;
+    p.x = Math.max(0, Math.min(1, p.x));
+    p.y = Math.max(0, Math.min(1, p.y));
+  }
+}
+
+// Smoothing for panel corners
+let smoothCorners = null;
+const SMOOTH = 0.35;
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function smoothRect(corners) {
+  if (!smoothCorners) { smoothCorners = corners.map(c => ({...c})); return smoothCorners; }
+  for (let i = 0; i < 4; i++) {
+    smoothCorners[i].x = lerp(smoothCorners[i].x, corners[i].x, SMOOTH);
+    smoothCorners[i].y = lerp(smoothCorners[i].y, corners[i].y, SMOOTH);
+  }
+  return smoothCorners;
+}
+
+// Detect L-shape: thumb tip and index tip extended, other fingers curled
+// MediaPipe landmark indices:
+// 4=thumb tip, 3=thumb IP, 2=thumb MCP
+// 8=index tip, 7=index DIP, 6=index PIP, 5=index MCP
+// 12=middle tip, 11=middle DIP
+// 16=ring tip, 15=ring DIP
+// 20=pinky tip, 19=pinky DIP
+function isLShape(landmarks) {
+  const thumbTip = landmarks[4];
+  const thumbIP = landmarks[3];
+  const indexTip = landmarks[8];
+  const indexPIP = landmarks[6];
+  const indexMCP = landmarks[5];
+  const middleTip = landmarks[12];
+  const middleDIP = landmarks[11];
+  const middlePIP = landmarks[10];
+  const ringTip = landmarks[16];
+  const ringDIP = landmarks[15];
+  const pinkyTip = landmarks[20];
+  const pinkyDIP = landmarks[19];
+  const wrist = landmarks[0];
+
+  // Index finger should be extended (tip above PIP in screen coords, i.e. lower y)
+  const indexExtended = indexTip.y < indexPIP.y;
+
+  // Thumb should be extended outward (significant x distance from index MCP)
+  const thumbExtended = Math.abs(thumbTip.x - indexMCP.x) > 0.05;
+
+  // Other fingers should be curled (tips below their DIP joints)
+  const middleCurled = middleTip.y > middlePIP.y;
+  const ringCurled = ringTip.y > ringDIP.y;
+  const pinkyCurled = pinkyTip.y > pinkyDIP.y;
+
+  return indexExtended && thumbExtended && middleCurled && ringCurled && pinkyCurled;
+}
+
+let panelVisible = false;
+let panelOpacity = 0;
+let lastDetectTime = 0;
+let glowPhase = 0;
+
+function onResults(results) {
+  octx.clearRect(0, 0, vw, vh);
+  pctx.clearRect(0, 0, vw, vh);
+
+  if (!results.multiHandLandmarks || results.multiHandLandmarks.length < 2) {
+    status.textContent = `Hands detected: ${results.multiHandLandmarks ? results.multiHandLandmarks.length : 0}/2`;
+    panelVisible = false;
+    panelOpacity = Math.max(0, panelOpacity - 0.05);
+    if (panelOpacity > 0) drawPanel(null);
+    smoothCorners = null;
+    return;
+  }
+
+  // Classify hands by handedness
+  let leftHand = null, rightHand = null;
+  for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+    const label = results.multiHandedness[i].label;
+    // MediaPipe mirrors: "Left" in results = user's right hand visually
+    if (label === 'Left') rightHand = results.multiHandLandmarks[i];
+    else leftHand = results.multiHandLandmarks[i];
+  }
+
+  if (!leftHand || !rightHand) {
+    // Both detected but same classification — just pick by x position
+    const h0 = results.multiHandLandmarks[0];
+    const h1 = results.multiHandLandmarks[1];
+    if (h0[0].x < h1[0].x) { leftHand = h0; rightHand = h1; }
+    else { leftHand = h1; rightHand = h0; }
+  }
+
+  const leftL = isLShape(leftHand);
+  const rightL = isLShape(rightHand);
+
+  // Draw landmarks
+  drawHand(octx, leftHand, leftL);
+  drawHand(octx, rightHand, rightL);
+
+  if (leftL && rightL) {
+    status.textContent = 'L-shape detected — panel active';
+    panelVisible = true;
+    panelOpacity = Math.min(1, panelOpacity + 0.08);
+
+    // Four corners: left thumb tip, left index tip, right index tip, right thumb tip
+    // In mirrored view, we need to form the rectangle from the 4 fingertips
+    const lt = leftHand[4];   // left thumb tip
+    const li = leftHand[8];   // left index tip
+    const rt = rightHand[4];  // right thumb tip
+    const ri = rightHand[8];  // right index tip
+
+    // Order as: top-left, top-right, bottom-right, bottom-left
+    // Index fingers are up (top), thumbs are out (sides/bottom)
+    const corners = [
+      { x: li.x * vw, y: li.y * vh },  // left index (top-left)
+      { x: ri.x * vw, y: ri.y * vh },  // right index (top-right)
+      { x: rt.x * vw, y: rt.y * vh },  // right thumb (bottom-right)
+      { x: lt.x * vw, y: lt.y * vh },  // left thumb (bottom-left)
+    ];
+
+    const smooth = smoothRect(corners);
+    drawPanel(smooth);
+  } else {
+    status.textContent = `L-shapes: left=${leftL}, right=${rightL}`;
+    panelVisible = false;
+    panelOpacity = Math.max(0, panelOpacity - 0.05);
+    if (panelOpacity > 0) drawPanel(null);
+    else smoothCorners = null;
+  }
+}
+
+function drawHand(ctx, landmarks, isL) {
+  const color = isL ? '#0f0' : '#666';
+  // Draw connections
+  const connections = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],
+    [13,17],[17,18],[18,19],[19,20],[0,17]
+  ];
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  for (const [a, b] of connections) {
+    ctx.beginPath();
+    ctx.moveTo(landmarks[a].x * vw, landmarks[a].y * vh);
+    ctx.lineTo(landmarks[b].x * vw, landmarks[b].y * vh);
+    ctx.stroke();
+  }
+  // Highlight thumb tip and index tip
+  if (isL) {
+    for (const idx of [4, 8]) {
+      ctx.beginPath();
+      ctx.arc(landmarks[idx].x * vw, landmarks[idx].y * vh, 8, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(0,255,100,0.7)';
+      ctx.fill();
+    }
+  }
+}
+
+function drawPanel(corners) {
+  if (!smoothCorners) return;
+  const c = corners || smoothCorners;
+  const opacity = panelOpacity;
+  if (opacity <= 0) return;
+
+  glowPhase += 0.03;
+  updateParticles();
+
+  pctx.save();
+  pctx.globalAlpha = opacity;
+
+  // Clip to the quadrilateral
+  pctx.beginPath();
+  pctx.moveTo(c[0].x, c[0].y);
+  pctx.lineTo(c[1].x, c[1].y);
+  pctx.lineTo(c[2].x, c[2].y);
+  pctx.lineTo(c[3].x, c[3].y);
+  pctx.closePath();
+  pctx.clip();
+
+  // Bounding box for filling
+  const minX = Math.min(c[0].x, c[1].x, c[2].x, c[3].x);
+  const maxX = Math.max(c[0].x, c[1].x, c[2].x, c[3].x);
+  const minY = Math.min(c[0].y, c[1].y, c[2].y, c[3].y);
+  const maxY = Math.max(c[0].y, c[1].y, c[2].y, c[3].y);
+  const w = maxX - minX;
+  const h = maxY - minY;
+
+  // Dark background
+  pctx.fillStyle = 'rgba(8, 12, 20, 0.92)';
+  pctx.fillRect(minX, minY, w, h);
+
+  // Animated grid
+  pctx.strokeStyle = `rgba(0, 255, 180, ${0.08 + 0.03 * Math.sin(glowPhase)})`;
+  pctx.lineWidth = 0.5;
+  const gridSpacing = 25;
+  const gridOffset = (glowPhase * 5) % gridSpacing;
+  for (let x = minX + gridOffset; x < maxX; x += gridSpacing) {
+    pctx.beginPath(); pctx.moveTo(x, minY); pctx.lineTo(x, maxY); pctx.stroke();
+  }
+  for (let y = minY + gridOffset; y < maxY; y += gridSpacing) {
+    pctx.beginPath(); pctx.moveTo(minX, y); pctx.lineTo(maxX, y); pctx.stroke();
+  }
+
+  // Particles
+  for (const p of particles) {
+    const px = minX + p.x * w;
+    const py = minY + p.y * h;
+    const glow = p.brightness * (0.7 + 0.3 * Math.sin(glowPhase + p.x * 10));
+    const r = p.size * (1 + 0.3 * Math.sin(glowPhase * 2 + p.y * 8));
+
+    pctx.beginPath();
+    pctx.arc(px, py, r, 0, Math.PI * 2);
+    const g = Math.floor(200 + 55 * glow);
+    const b = Math.floor(180 + 75 * glow);
+    pctx.fillStyle = `rgba(${Math.floor(30 * glow)}, ${g}, ${b}, ${glow * 0.8})`;
+    pctx.fill();
+
+    // Particle glow
+    if (r > 1.5) {
+      pctx.beginPath();
+      pctx.arc(px, py, r * 3, 0, Math.PI * 2);
+      pctx.fillStyle = `rgba(0, ${g}, ${b}, ${glow * 0.12})`;
+      pctx.fill();
+    }
+  }
+
+  pctx.restore();
+
+  // Glow border around the quad
+  pctx.save();
+  pctx.globalAlpha = opacity;
+  const glowIntensity = 0.5 + 0.3 * Math.sin(glowPhase * 1.5);
+
+  // Outer glow
+  pctx.shadowColor = `rgba(0, 255, 160, ${glowIntensity})`;
+  pctx.shadowBlur = 25;
+  pctx.strokeStyle = `rgba(0, 255, 160, ${0.6 * glowIntensity})`;
+  pctx.lineWidth = 2;
+  pctx.beginPath();
+  pctx.moveTo(c[0].x, c[0].y);
+  pctx.lineTo(c[1].x, c[1].y);
+  pctx.lineTo(c[2].x, c[2].y);
+  pctx.lineTo(c[3].x, c[3].y);
+  pctx.closePath();
+  pctx.stroke();
+
+  // Inner bright edge
+  pctx.shadowBlur = 8;
+  pctx.shadowColor = `rgba(100, 255, 200, ${glowIntensity})`;
+  pctx.strokeStyle = `rgba(100, 255, 220, ${0.4 + 0.2 * glowIntensity})`;
+  pctx.lineWidth = 1;
+  pctx.stroke();
+
+  // Corner dots
+  for (const pt of c) {
+    pctx.beginPath();
+    pctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
+    pctx.fillStyle = `rgba(0, 255, 180, ${0.8 * glowIntensity})`;
+    pctx.shadowColor = 'rgba(0, 255, 180, 0.9)';
+    pctx.shadowBlur = 15;
+    pctx.fill();
+  }
+
+  pctx.restore();
+}
+
+// Init MediaPipe Hands
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+});
+
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.5
+});
+
+hands.onResults(onResults);
+
+// Start camera
+const camera = new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 1280,
+  height: 720
+});
+
+camera.start().then(() => {
+  status.textContent = 'Camera active — show both hands with L-shapes';
+}).catch(err => {
+  status.textContent = 'Camera error: ' + err.message;
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hand Connect</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; }
+  #container { position: relative; width: 100vw; height: 100vh; }
+  video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); opacity: 0.25; }
+  canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  #status { position: absolute; top: 16px; left: 16px; color: #0ff; font-size: 13px; z-index: 10; background: rgba(0,0,0,0.7); padding: 6px 12px; border-radius: 6px; font-family: monospace; }
+</style>
+</head>
+<body>
+<div id="container">
+  <video id="video" autoplay playsinline></video>
+  <canvas id="c"></canvas>
+  <div id="status">Loading MediaPipe...</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.min.js"></script>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const status = document.getElementById('status');
+
+let W, H;
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W; canvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Finger bone connections
+const BONES = [
+  [0,1],[1,2],[2,3],[3,4],       // thumb
+  [0,5],[5,6],[6,7],[7,8],       // index
+  [5,9],[9,10],[10,11],[11,12],  // middle
+  [9,13],[13,14],[14,15],[15,16],// ring
+  [13,17],[17,18],[18,19],[19,20],// pinky
+  [0,17]                          // palm base
+];
+
+// Cross-hand connections between matching landmarks
+const CROSS_PAIRS = [4,8,12,16,20, 0,5,9,13,17];
+
+// Color palettes per finger group
+const FINGER_COLORS = [
+  { h: 300, s: '100%', name: 'thumb' },   // magenta
+  { h: 180, s: '100%', name: 'index' },   // cyan
+  { h: 120, s: '100%', name: 'middle' },  // green
+  { h: 50,  s: '100%', name: 'ring' },    // yellow
+  { h: 270, s: '100%', name: 'pinky' },   // purple
+];
+
+function boneFingerIndex(boneIdx) {
+  if (boneIdx < 4) return 0;
+  if (boneIdx < 8) return 1;
+  if (boneIdx < 12) return 2;
+  if (boneIdx < 16) return 3;
+  if (boneIdx < 20) return 4;
+  return 4; // palm base -> pinky color
+}
+
+let t = 0;
+// Trail history per hand per landmark
+const trails = [new Array(21).fill(null).map(() => []), new Array(21).fill(null).map(() => [])];
+const TRAIL_LEN = 6;
+
+// Energy pulse state per bone
+const pulses = [];
+for (let h = 0; h < 2; h++) {
+  const hp = [];
+  for (let i = 0; i < BONES.length; i++) {
+    hp.push({ pos: Math.random(), speed: 0.01 + Math.random() * 0.02, size: 2 + Math.random() * 2 });
+  }
+  pulses.push(hp);
+}
+
+function px(lm) { return lm.x * W; }
+function py(lm) { return lm.y * H; }
+
+function onResults(results) {
+  t += 0.02;
+  ctx.clearRect(0, 0, W, H);
+
+  // Mirror the canvas to match mirrored video
+  ctx.save();
+  ctx.translate(W, 0);
+  ctx.scale(-1, 1);
+
+  const hands = results.multiHandLandmarks;
+  if (!hands || hands.length === 0) {
+    ctx.restore();
+    status.textContent = 'Show your hands';
+    return;
+  }
+
+  status.textContent = `Tracking ${hands.length} hand${hands.length > 1 ? 's' : ''}`;
+
+  // Update trails
+  for (let hi = 0; hi < hands.length; hi++) {
+    for (let li = 0; li < 21; li++) {
+      const tr = trails[hi][li];
+      tr.push({ x: px(hands[hi][li]), y: py(hands[hi][li]) });
+      if (tr.length > TRAIL_LEN) tr.shift();
+    }
+  }
+
+  // Draw each hand
+  for (let hi = 0; hi < hands.length; hi++) {
+    const lm = hands[hi];
+    drawHandGlow(lm, hi);
+    drawBones(lm, hi);
+    drawJoints(lm, hi);
+    drawPulses(lm, hi);
+  }
+
+  // Cross-hand connections
+  if (hands.length === 2) {
+    drawCrossLinks(hands[0], hands[1]);
+  }
+
+  ctx.restore();
+}
+
+function drawHandGlow(lm, hi) {
+  // Subtle ambient glow from palm center
+  const cx = (px(lm[0]) + px(lm[5]) + px(lm[9]) + px(lm[13]) + px(lm[17])) / 5;
+  const cy = (py(lm[0]) + py(lm[5]) + py(lm[9]) + py(lm[13]) + py(lm[17])) / 5;
+  const hue = hi === 0 ? 180 : 300;
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 180);
+  grad.addColorStop(0, `hsla(${hue}, 100%, 60%, 0.06)`);
+  grad.addColorStop(1, `hsla(${hue}, 100%, 40%, 0)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(cx - 200, cy - 200, 400, 400);
+}
+
+function drawBones(lm, hi) {
+  for (let bi = 0; bi < BONES.length; bi++) {
+    const [a, b] = BONES[bi];
+    const fi = boneFingerIndex(bi);
+    const col = FINGER_COLORS[fi];
+    const pulse = 0.7 + 0.3 * Math.sin(t * 3 + bi * 0.5 + hi * Math.PI);
+
+    const x1 = px(lm[a]), y1 = py(lm[a]);
+    const x2 = px(lm[b]), y2 = py(lm[b]);
+
+    // Outer glow
+    ctx.save();
+    ctx.shadowColor = `hsla(${col.h}, ${col.s}, 60%, ${0.8 * pulse})`;
+    ctx.shadowBlur = 18;
+    ctx.strokeStyle = `hsla(${col.h}, ${col.s}, 65%, ${0.35 * pulse})`;
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+
+    // Core line
+    ctx.save();
+    ctx.shadowColor = `hsla(${col.h}, ${col.s}, 70%, ${pulse})`;
+    ctx.shadowBlur = 10;
+    ctx.strokeStyle = `hsla(${col.h}, ${col.s}, 75%, ${0.9 * pulse})`;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+
+    // Bright inner
+    ctx.strokeStyle = `hsla(${col.h}, 50%, 95%, ${0.5 * pulse})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+  }
+}
+
+function drawPulses(lm, hi) {
+  for (let bi = 0; bi < BONES.length; bi++) {
+    const [a, b] = BONES[bi];
+    const p = pulses[hi][bi];
+    p.pos += p.speed;
+    if (p.pos > 1) p.pos -= 1;
+
+    const fi = boneFingerIndex(bi);
+    const col = FINGER_COLORS[fi];
+    const x = px(lm[a]) + (px(lm[b]) - px(lm[a])) * p.pos;
+    const y = py(lm[a]) + (py(lm[b]) - py(lm[a])) * p.pos;
+
+    ctx.save();
+    ctx.shadowColor = `hsla(${col.h}, 100%, 80%, 1)`;
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.arc(x, y, p.size, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${col.h}, 100%, 90%, 0.9)`;
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawJoints(lm, hi) {
+  const TIPS = [4, 8, 12, 16, 20];
+  const MCPS = [1, 5, 9, 13, 17];
+
+  for (let i = 0; i < 21; i++) {
+    const x = px(lm[i]), y = py(lm[i]);
+    const isTip = TIPS.includes(i);
+    const isMcp = MCPS.includes(i);
+    const isWrist = i === 0;
+
+    // Determine color from finger group
+    let fi;
+    if (i <= 4) fi = 0;
+    else if (i <= 8) fi = 1;
+    else if (i <= 12) fi = 2;
+    else if (i <= 16) fi = 3;
+    else fi = 4;
+    const col = FINGER_COLORS[fi];
+
+    const basePulse = 0.7 + 0.3 * Math.sin(t * 2.5 + i * 0.3);
+
+    if (isTip) {
+      // Fingertip — large bright node
+      const r = 6 + 2 * Math.sin(t * 4 + i);
+      ctx.save();
+      ctx.shadowColor = `hsla(${col.h}, 100%, 70%, 1)`;
+      ctx.shadowBlur = 25;
+
+      // Outer ring
+      ctx.beginPath();
+      ctx.arc(x, y, r + 3, 0, Math.PI * 2);
+      ctx.strokeStyle = `hsla(${col.h}, 100%, 60%, ${0.4 * basePulse})`;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Filled core
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r);
+      grad.addColorStop(0, `hsla(${col.h}, 60%, 95%, 0.95)`);
+      grad.addColorStop(0.5, `hsla(${col.h}, 100%, 65%, 0.8)`);
+      grad.addColorStop(1, `hsla(${col.h}, 100%, 45%, 0.3)`);
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.restore();
+
+      // Trail
+      const tr = trails[hi][i];
+      for (let ti = 0; ti < tr.length - 1; ti++) {
+        const alpha = (ti / tr.length) * 0.35;
+        ctx.beginPath();
+        ctx.arc(tr[ti].x, tr[ti].y, 2, 0, Math.PI * 2);
+        ctx.fillStyle = `hsla(${col.h}, 100%, 70%, ${alpha})`;
+        ctx.fill();
+      }
+
+    } else if (isWrist || isMcp) {
+      // Junction nodes — square circuit aesthetic
+      const s = isWrist ? 7 : 5;
+      ctx.save();
+      ctx.shadowColor = `hsla(${col.h}, 100%, 60%, 0.8)`;
+      ctx.shadowBlur = 12;
+      ctx.translate(x, y);
+      ctx.rotate(t * 0.5 + i);
+      ctx.fillStyle = `hsla(${col.h}, 100%, 70%, ${0.7 * basePulse})`;
+      ctx.fillRect(-s / 2, -s / 2, s, s);
+      ctx.strokeStyle = `hsla(${col.h}, 50%, 90%, ${0.5 * basePulse})`;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(-s / 2, -s / 2, s, s);
+      ctx.restore();
+
+    } else {
+      // Mid-joint — small circle
+      const r = 3;
+      ctx.save();
+      ctx.shadowColor = `hsla(${col.h}, 100%, 60%, 0.6)`;
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${col.h}, 100%, 65%, ${0.65 * basePulse})`;
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+function drawCrossLinks(lm0, lm1) {
+  for (const li of CROSS_PAIRS) {
+    const x1 = px(lm0[li]), y1 = py(lm0[li]);
+    const x2 = px(lm1[li]), y2 = py(lm1[li]);
+    const dist = Math.hypot(x2 - x1, y2 - y1);
+    const maxDist = W * 0.55;
+    if (dist > maxDist) continue;
+
+    const alpha = (1 - dist / maxDist) * 0.4;
+    const pulse = 0.6 + 0.4 * Math.sin(t * 2 + li * 0.4);
+
+    // Determine hue — blend between the two hand palettes
+    const hue = 200 + 40 * Math.sin(t + li * 0.3);
+
+    ctx.save();
+    ctx.shadowColor = `hsla(${hue}, 100%, 60%, ${alpha * pulse})`;
+    ctx.shadowBlur = 15;
+
+    // Dashed style for cross links
+    ctx.setLineDash([8, 12]);
+    ctx.lineDashOffset = -t * 60;
+    ctx.strokeStyle = `hsla(${hue}, 80%, 70%, ${alpha * pulse})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+
+    // Midpoint energy node
+    if (alpha > 0.15) {
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      const r = 3 * alpha * pulse * 4;
+      ctx.save();
+      ctx.shadowColor = `hsla(${hue}, 100%, 80%, ${alpha})`;
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.arc(mx, my, r, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${hue}, 100%, 85%, ${alpha * 0.7})`;
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+// Init
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+});
+
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.5
+});
+
+hands.onResults(onResults);
+
+const camera = new Camera(video, {
+  onFrame: async () => { await hands.send({ image: video }); },
+  width: 1280,
+  height: 720
+});
+
+camera.start().then(() => {
+  status.textContent = 'Show your hands';
+}).catch(err => {
+  status.textContent = 'Camera error: ' + err.message;
+});
+</script>
+</body>
+</html>
